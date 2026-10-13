@@ -1541,6 +1541,7 @@ fn document_to_psd_nested(doc: &Document, opts: &PsdExportOptions, depth: u32, c
     if fmt.mode != doc.mode {
         ex.warnings.push(format!("{:?} document written as {:?}", doc.mode, fmt.mode));
     }
+    let mut type_error = None;
     // Assign layer ids up front (stable across round trips): keep unique
     // `psd_id`s, number the rest after them; dividers come after all.
     {
@@ -1599,8 +1600,14 @@ fn document_to_psd_nested(doc: &Document, opts: &PsdExportOptions, depth: u32, c
             if !matches!(l.content, LayerContent::Text(_)) || ex.text_index.contains_key(&l.id) {
                 continue;
             }
-            while used_txt.contains(&next_txt) {
+            while next_txt <= photocraft_text::psd::MAX_TEXT_INDEX && used_txt.contains(&next_txt) {
                 next_txt += 1;
+            }
+            if next_txt > photocraft_text::psd::MAX_TEXT_INDEX {
+                // Orphan native objects occupy slots too. Never assign a number the global
+                // writer cannot represent, even when only one visible text layer remains.
+                type_error = Some("all PSD text object slots are occupied".into());
+                break;
             }
             used_txt.insert(next_txt);
             ex.text_index.insert(l.id, next_txt);
@@ -1753,8 +1760,7 @@ fn document_to_psd_nested(doc: &Document, opts: &PsdExportOptions, depth: u32, c
     let text_layers: Vec<_> = emitted_text.iter().map(|(index, text)| (*index, text)).collect();
     // A complete cacheless view is valid native text data. Dropping the whole Txt2 block
     // instead makes Photoshop classify every layer as old text requiring an update.
-    let mut type_error = None;
-    let txt2 = if text_layers.is_empty() {
+    let txt2 = if text_layers.is_empty() || type_error.is_some() {
         None
     } else {
         match photocraft_text::psd::build_complete_txt2(&text_layers, previous.as_deref(), ex.dpi, &ex.changed_text, &preserve_frames) {

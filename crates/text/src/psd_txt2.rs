@@ -543,6 +543,9 @@ pub(super) fn build(
     changed: &HashSet<i32>,
     preserve_frames: &HashSet<i32>,
 ) -> Result<Vec<u8>, String> {
+    if let Some((index, _)) = objects.iter().find(|(index, _)| !(0..=super::MAX_TEXT_INDEX).contains(index)) {
+        return Err(format!("text object {index}: its index is outside 0..={}", super::MAX_TEXT_INDEX));
+    }
     let previous_tree = previous.and_then(super::parse_txt2);
     let mut outer = dictionary(previous_tree.as_ref());
     if outer.get("98").is_none() {
@@ -816,6 +819,43 @@ mod tests {
             inner.set("6", parent);
         }
         dict([("0", inner)])
+    }
+
+    fn assert_invalid_complete_txt2_index_is_an_error(index: i32) {
+        let layer = layer("current");
+        let previous = super::super::build_complete_txt2(&[(0, &layer)], None, 72.0, &HashSet::new(), &HashSet::new()).unwrap();
+        for previous in [None, Some(previous.as_slice())] {
+            for objects in [vec![(index, &layer)], vec![(0, &layer), (index, &layer)], vec![(index, &layer), (0, &layer)]] {
+                let result = super::super::build_complete_txt2(&objects, previous, 72.0, &HashSet::new(), &HashSet::new());
+                assert!(result.is_err(), "invalid text object index {index} must reject the entire public export instead of silently skipping its text");
+            }
+        }
+    }
+
+    #[test]
+    fn complete_txt2_rejects_negative_object_indexes() {
+        assert_invalid_complete_txt2_index_is_an_error(-1);
+    }
+
+    #[test]
+    fn complete_txt2_rejects_indexes_above_its_limit() {
+        assert_invalid_complete_txt2_index_is_an_error(super::super::MAX_TEXT_INDEX + 1);
+    }
+
+    #[test]
+    fn complete_txt2_rejects_extreme_object_indexes() {
+        assert_invalid_complete_txt2_index_is_an_error(i32::MAX);
+    }
+
+    #[test]
+    fn complete_txt2_preserves_the_maximum_valid_object_index() {
+        let layer = layer("current");
+        let index = super::super::MAX_TEXT_INDEX;
+        let output = super::super::build_complete_txt2(&[(index, &layer)], None, 72.0, &HashSet::new(), &HashSet::new()).unwrap();
+        let tree = super::super::parse_txt2(&output).unwrap();
+        let slots = tree.path(&["1", "1"]).and_then(E::as_array).unwrap();
+        assert_eq!(slots.len(), index as usize + 1);
+        assert_eq!(slots[index as usize].path(&["0", "0"]).and_then(E::as_str), Some("current\r"));
     }
 
     #[test]

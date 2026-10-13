@@ -684,3 +684,117 @@ fn document_style_export_uses_emitted_local_properties_for_the_global_model() {
         }
     }
 }
+
+fn slot_boundary_document(slot_count: usize, empty_slots: &[usize]) -> Document {
+    let mut doc = Document::new("text-slot-boundary", Size::new(16, 16), ColorMode::Rgb, SampleType::U8);
+    doc.layers.push(Layer::new("Added", LayerContent::Text(new_type("N", Affine::translate(2.0, 12.0)))));
+    // These are opaque archived objects with no owning layer. Construct the input bytes
+    // directly: fixture creation must not call the allocator or global writer under test.
+    let mut bytes = b"/1 << /1 [\n".to_vec();
+    for index in 0..slot_count {
+        if empty_slots.contains(&index) {
+            bytes.extend_from_slice(b"<< >>\n");
+        } else {
+            bytes.extend_from_slice(format!("<< /ArchivedSlot {index} >>\n").as_bytes());
+        }
+    }
+    bytes.extend_from_slice(b"] >>\n");
+    doc.metadata.psd_global_blocks.push((*b"8BIM", *b"Txt2", Arc::new(bytes)));
+    doc
+}
+
+fn assert_exhausted_slots_fail(extension: &str, options: photocraft_io::ExportOptions) {
+    let doc = slot_boundary_document(photocraft_text::psd::MAX_TEXT_INDEX as usize + 1, &[]);
+    let original_global = doc.metadata.psd_global_blocks.clone();
+    match photocraft_io::export(&doc, &format!("exhausted.{extension}"), &options) {
+        Err(photocraft_io::IoError::Unsupported(message)) => {
+            assert!(!message.is_empty(), "the slot exhaustion must report an actionable error");
+        }
+        Err(error) => panic!("text slot exhaustion must be an unsupported conversion, got {error}"),
+        Ok(result) => panic!("exhausted text slots must fail before returning bytes; {extension} returned {} bytes", result.bytes.len()),
+    }
+    assert_eq!(doc.metadata.psd_global_blocks, original_global, "a failed export must not rewrite its input metadata");
+    assert_eq!(text(&doc, "Added").text, "N");
+    assert!(text(&doc, "Added").psd_raw.is_none(), "export must not attach a partially assigned index to the input type");
+}
+
+#[test]
+fn exhausted_text_object_slots_fail_psd_export_without_bytes() {
+    assert_exhausted_slots_fail("psd", Default::default());
+}
+
+#[test]
+fn exhausted_text_object_slots_fail_psb_export_without_bytes() {
+    assert_exhausted_slots_fail("psb", Default::default());
+}
+
+#[test]
+fn exhausted_text_object_slots_fail_layered_tiff_export_without_bytes() {
+    assert_exhausted_slots_fail("tif", photocraft_io::ExportOptions { tiff_layers: true, ..Default::default() });
+}
+
+fn assert_slot_boundary_roundtrip(free_slot: usize) {
+    let slot_count = photocraft_text::psd::MAX_TEXT_INDEX as usize + 1;
+    let doc = slot_boundary_document(slot_count, &[free_slot]);
+    for extension in ["psd", "psb"] {
+        let bytes = photocraft_io::export(&doc, &format!("slot-boundary.{extension}"), &Default::default()).unwrap().bytes;
+        let file = PsdFile::from_bytes(&bytes).unwrap();
+        let back = photocraft_io::import(&format!("slot-boundary.{extension}"), &bytes).unwrap().document;
+        let current = text(&back, "Added");
+        let index = photocraft_text::psd::text_index(current.psd_raw.as_deref().unwrap()).expect("the emitted TextIndex must be in the supported range");
+        assert_eq!(index as usize, free_slot);
+        assert_eq!(current.text, "N");
+        assert_transform(current.transform, Affine::translate(2.0, 12.0));
+        let global = tree(&file);
+        assert_current_object(&global, current);
+        let objects = global.path(&["1", "1"]).and_then(E::as_array).unwrap();
+        assert_eq!(objects.len(), slot_count, "saving must neither discard archived slots nor append an out-of-range slot");
+        for (index, object) in objects.iter().enumerate() {
+            if index != free_slot {
+                assert_eq!(object.get("ArchivedSlot").and_then(E::as_i64), Some(index as i64), "archived object {index} changed");
+            }
+        }
+        assert_eq!(back.layers.len(), 1, "archived objects must not become visible layers");
+    }
+}
+
+#[test]
+fn the_last_supported_text_object_slot_roundtrips_without_losing_archived_objects() {
+    assert_slot_boundary_roundtrip(photocraft_text::psd::MAX_TEXT_INDEX as usize);
+}
+
+#[test]
+fn a_free_text_object_hole_is_reused_even_with_an_occupied_tail_slot() {
+    assert_slot_boundary_roundtrip(7);
+}
+
+#[test]
+fn malformed_principal_text_indices_are_renumbered_to_a_valid_free_slot() {
+    for invalid in [-1, photocraft_text::psd::MAX_TEXT_INDEX + 1, i32::MAX] {
+        let mut doc = slot_boundary_document(3, &[1]);
+        let current = text_mut(&mut doc, "Added");
+        let mut tysh = photocraft_text::psd::parse_tysh(&photocraft_text::psd::build_tysh(current, 72.0, None)).unwrap();
+        // Represent malformed imported data without using set_text_index, whose validation
+        // must not determine which hostile values this input fixture can contain.
+        tysh.text.items.iter_mut().find(|(key, _)| key.is("TextIndex")).unwrap().1 = D::Integer(invalid);
+        let raw = Arc::new(photocraft_text::psd::write_tysh(&tysh));
+        current.psd_raw = Some(raw.clone());
+        doc.layers[0].psd_blocks.push((*b"TySh", raw));
+        for extension in ["psd", "psb"] {
+            let bytes = photocraft_io::export(&doc, &format!("malformed-index.{extension}"), &Default::default()).unwrap().bytes;
+            let file = PsdFile::from_bytes(&bytes).unwrap();
+            let back = photocraft_io::import(&format!("malformed-index.{extension}"), &bytes).unwrap().document;
+            let current = text(&back, "Added");
+            assert_eq!(photocraft_text::psd::text_index(current.psd_raw.as_deref().unwrap()), Some(1));
+            assert_eq!(current.text, "N");
+            assert_transform(current.transform, Affine::translate(2.0, 12.0));
+            let global = tree(&file);
+            assert_current_object(&global, current);
+            let objects = global.path(&["1", "1"]).and_then(E::as_array).unwrap();
+            assert_eq!(objects.len(), 3);
+            for index in [0, 2] {
+                assert_eq!(objects[index].get("ArchivedSlot").and_then(E::as_i64), Some(index as i64));
+            }
+        }
+    }
+}
