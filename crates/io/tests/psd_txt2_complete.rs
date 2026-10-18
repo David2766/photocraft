@@ -356,6 +356,82 @@ fn a_style_only_edit_updates_the_object_without_changing_its_text_or_sibling() {
 }
 
 #[test]
+fn repeated_unicode_edits_update_mixed_styles_and_paragraphs_in_the_global_model() {
+    let (mut doc, previous) = native_fixture();
+    let sibling = text(&doc, "Other").clone();
+    let original = photocraft_text::psd::parse_txt2(&previous).unwrap();
+    // Same UTF-16 length as Alpha, then longer with a paragraph, then shorter.
+    // The first run owns an entire surrogate pair, rather than half an emoji.
+    for (value, size, align) in
+        [("\u{1f600}ABC", 25.0, TextAlign::Right), ("\u{1f600}AB\nCDEF", 31.0, TextAlign::Center), ("\u{1f600}x", 21.0, TextAlign::Left)]
+    {
+        let (dpi, fmt) = (doc.resolution_dpi, doc.pixel_format());
+        let edited = text_mut(&mut doc, "Alpha");
+        edited.text = value.into();
+        edited.runs = vec![
+            TextRun {
+                len: '\u{1f600}'.len_utf8(),
+                style: CharStyle { font_family: "Inter".into(), postscript_name: Some("Inter-Regular".into()), size_pt: size, ..Default::default() },
+            },
+            TextRun {
+                len: value.len() - '\u{1f600}'.len_utf8(),
+                style: CharStyle {
+                    font_family: "Courier New".into(),
+                    postscript_name: Some("CourierNewPSMT".into()),
+                    size_pt: size + 4.0,
+                    underline: true,
+                    ..Default::default()
+                },
+            },
+        ];
+        edited.paragraphs = vec![ParagraphRun { len: value.len(), style: ParagraphStyle { align, ..Default::default() } }];
+        edited.sync_summary();
+        refresh(edited, dpi, fmt);
+        let (mut file, back) = export(&doc);
+        let global = tree(&file);
+        assert_changed_cache_is_invalidated(&global, text(&back, "Alpha"));
+        let object = object_for(&global, text(&back, "Alpha"));
+        let expected = format!("{}\r", value.replace('\n', "\r"));
+        for key in ["5", "6"] {
+            let runs = object.path(&["0", key, "0"]).and_then(E::as_array).unwrap();
+            assert_eq!(runs.iter().map(|run| run.get("1").and_then(E::as_i64).unwrap()).sum::<i64>(), expected.encode_utf16().count() as i64);
+        }
+        assert_eq!(global.get("UnmodeledOpaqueGlobal"), original.get("UnmodeledOpaqueGlobal"));
+        assert_eq!(text(&back, "Other").psd_raw, sibling.psd_raw);
+
+        // Remove local EngineData so the assertion cannot pass using TySh's styles
+        // while the saved global model still contains an older edit or old runs.
+        let record = file.layer_info.as_mut().unwrap().layers.iter_mut().find(|layer| layer.name() == "Alpha").unwrap();
+        let raw = &mut record.block_mut(b"TySh").unwrap().data;
+        let mut tysh = photocraft_text::psd::parse_tysh(raw).unwrap();
+        tysh.text.items.retain(|(key, _)| !key.is("EngineData"));
+        *raw = photocraft_text::psd::write_tysh(&tysh);
+        let global_only = photocraft_io::import("global-only.psd", &file.to_bytes().unwrap()).unwrap().document;
+        for actual in [text(&back, "Alpha"), text(&global_only, "Alpha")] {
+            assert_eq!(actual.text, value);
+            let mut at = 0;
+            for run in actual.char_runs() {
+                let end = at + run.len;
+                assert!(value.is_char_boundary(at) && value.is_char_boundary(end), "a run split a Unicode scalar");
+                let first = at < '\u{1f600}'.len_utf8();
+                if first {
+                    assert_eq!(end, '\u{1f600}'.len_utf8(), "the first style must stop immediately after the emoji");
+                }
+                assert_eq!(run.style.size_pt, if first { size } else { size + 4.0 });
+                assert_eq!(run.style.postscript_name.as_deref(), Some(if first { "Inter-Regular" } else { "CourierNewPSMT" }));
+                assert_eq!(run.style.underline, !first);
+                at = end;
+            }
+            assert_eq!(at, value.len());
+            assert!(actual.paragraphs.iter().all(|run| run.style.align == align));
+            // Paragraph coverage includes Photoshop's mandatory terminal break.
+            assert_eq!(actual.paragraphs.iter().map(|run| run.len).sum::<usize>(), expected.len());
+        }
+        doc = back;
+    }
+}
+
+#[test]
 fn a_moved_type_frame_matches_the_local_descriptor_after_reopening_twice() {
     let (mut doc, _) = native_fixture();
     let (dpi, fmt) = (doc.resolution_dpi, doc.pixel_format());

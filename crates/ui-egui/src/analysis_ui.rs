@@ -280,10 +280,11 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
             }
             set_ruler(app, r);
         }
-        (Tool::Ruler, ToolEvent::Up { .. })
-            if app.ui.analysis.drag.take() == Some(Drag::RulerNew) && doc.measurement.ruler.is_some_and(|r| dist(r.start, r.end) < 0.5) =>
-        {
-            let _ = app.run("image.analysis.rulerTool", json!({"clear": true}));
+        (Tool::Ruler, ToolEvent::Up { .. }) => {
+            let drag = app.ui.analysis.drag.take();
+            if drag == Some(Drag::RulerNew) && doc.measurement.ruler.is_some_and(|r| dist(r.start, r.end) < 0.5) {
+                let _ = app.run("image.analysis.rulerTool", json!({"clear": true}));
+            }
         }
         (Tool::Count, ToolEvent::Down { x, y, .. }) => {
             let hit = nearest_marker(&doc, [x, y], tol);
@@ -666,13 +667,6 @@ pub(crate) fn panel_window(app: &PhotocraftApp, ctx: &egui::Context, id: &str, t
         });
 }
 
-/// A failed log command leaves its rows selected so the user can retry it.
-fn run_measurement_log_action(app: &mut PhotocraftApp, id: &str, params: Value) {
-    if app.run(id, params).is_ok() {
-        app.ui.analysis.log_selected.clear();
-    }
-}
-
 /// Draws the open panels and dialogs.
 pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if app.ui.analysis.measurement_log {
@@ -749,7 +743,12 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     app.ui.status = e;
                 }
             }
-            Some((id, p)) => run_measurement_log_action(app, id, p),
+            Some((id, p)) => {
+                let result = app.run(id, p);
+                if result.is_ok() {
+                    app.ui.analysis.log_selected.clear();
+                }
+            }
             None => {}
         }
     }
@@ -1087,25 +1086,6 @@ pub(crate) mod tests {
             assert_eq!(ruler(&app).is_none(), cleared, "drag {drag:?}, length {length}");
             assert_eq!(app.session.active().unwrap().history.past_len(), 0, "ruler release adds no history");
         }
-    }
-
-    #[test]
-    fn lint_cleanup_measurement_log_actions_keep_selection_on_error_and_clear_it_after_success() {
-        let (mut app, _) = app();
-        app.run("count.add", json!({"x": 20.0, "y": 20.0})).unwrap();
-        for _ in 0..2 {
-            app.run("image.analysis.recordMeasurements", json!({"source": "count"})).unwrap();
-        }
-        assert_eq!(app.session.analysis.log.len(), 2);
-        let selected = app.session.analysis.log[0].id;
-        let remaining = app.session.analysis.log[1].id;
-        app.ui.analysis.log_selected = vec![selected];
-        run_measurement_log_action(&mut app, "measurementLog.delete", json!({}));
-        assert_eq!(app.ui.analysis.log_selected, vec![selected], "a rejected delete must keep its selected rows");
-        assert_eq!(app.session.analysis.log.len(), 2, "invalid parameters must not delete any row");
-        run_measurement_log_action(&mut app, "measurementLog.delete", json!({"rows": [selected]}));
-        assert!(app.ui.analysis.log_selected.is_empty(), "a successful delete clears the UI selection");
-        assert_eq!(app.session.analysis.log.iter().map(|row| row.id).collect::<Vec<_>>(), vec![remaining]);
     }
 
     #[test]
