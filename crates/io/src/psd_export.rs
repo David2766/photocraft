@@ -1869,7 +1869,7 @@ fn document_to_psd_nested(doc: &Document, opts: &PsdExportOptions, depth: u32, c
         }
     };
     for (sig, key, data) in preserved {
-        if txt2.is_some() && key == *b"Txt2" {
+        if (txt2.is_some() || type_error.is_some()) && key == *b"Txt2" {
             continue;
         }
         // A kept layer block (one the import could not read, #2700) describes layers the

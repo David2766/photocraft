@@ -809,6 +809,103 @@ fn exhausted_text_object_slots_fail_layered_tiff_export_without_bytes() {
     assert_exhausted_slots_fail("tif", photocraft_io::ExportOptions { tiff_layers: true, ..Default::default() });
 }
 
+fn legacy_error_fixture(allocator: bool) -> (Document, &'static str, &'static str) {
+    let (mut doc, layer_name, error) = if allocator {
+        (slot_boundary_document(photocraft_text::psd::MAX_TEXT_INDEX as usize + 1, &[]), "Added", "all PSD text object slots are occupied")
+    } else {
+        let (mut doc, _) = native_fixture();
+        let block = doc.metadata.psd_global_blocks.iter_mut().find(|(_, key, _)| key == b"Txt2").unwrap();
+        let mut global = photocraft_text::psd::parse_txt2(&block.2).unwrap();
+        let E::Array(sheets) = global.get_mut("0").unwrap().get_mut("6").unwrap().get_mut("0").unwrap() else { panic!("named paragraphs required") };
+        let root = sheets[0].get_mut("0").unwrap();
+        root.set("0", E::String("Custom cyclic paragraph".into()));
+        root.set("6", E::Int(0));
+        let E::Dict(items) = global else { panic!("global dictionary required") };
+        block.2 = Arc::new(ed::write_bare(&items));
+        let edited = text_mut(&mut doc, "Alpha");
+        edited.text = "Current Alpha".into();
+        edited.runs[0].len = edited.text.len();
+        edited.sync_summary();
+        (doc, "Alpha", "paragraph style ancestry contains a cycle")
+    };
+    let (dpi, fmt) = (doc.resolution_dpi, doc.pixel_format());
+    refresh(text_mut(&mut doc, layer_name), dpi, fmt);
+    doc.metadata.psd_global_blocks.push((*b"8BIM", *b"zZlg", Arc::new(b"legacy\0\xffopaque".to_vec())));
+    (doc, layer_name, error)
+}
+
+fn assert_legacy_error_model(file: &PsdFile, doc: &Document, layer_name: &str) {
+    assert!(file.global_blocks.iter().all(|block| &block.key != b"Txt2"), "a failed text conversion must not return the preserved old global text engine");
+    let opaque = file.global_blocks.iter().find(|block| &block.key == b"zZlg").expect("unrelated opaque global block must survive");
+    assert_eq!(opaque.data.as_slice(), b"legacy\0\xffopaque");
+    let record = file.layer_info.as_ref().unwrap().layers.iter().find(|layer| layer.name() == layer_name).unwrap();
+    let current = photocraft_text::psd::parse_tysh(text(doc, layer_name).psd_raw.as_deref().unwrap()).unwrap();
+    let emitted = photocraft_text::psd::parse_tysh(&record.block(b"TySh").expect("current local type must survive").data).unwrap();
+    assert_eq!(emitted.text.get("Txt "), current.text.get("Txt "), "the fallback must keep the current local text rather than its old global text");
+    assert_transform(emitted.transform, current.transform);
+    let saved = PsdFile::from_bytes(&file.to_bytes().unwrap()).unwrap();
+    assert!(saved.global_blocks.iter().all(|block| &block.key != b"Txt2"), "serializing the legacy model must not restore stale global text");
+}
+
+fn assert_legacy_error(allocator: bool, with_options: bool) {
+    let (doc, layer_name, error) = legacy_error_fixture(allocator);
+    let original = doc.clone();
+    if with_options {
+        for force_psb in [false, true] {
+            let (file, warnings) = photocraft_io::document_to_psd_with(&doc, &photocraft_io::PsdExportOptions { force_psb, ..Default::default() });
+            assert!(warnings.iter().any(|warning| warning.contains("PSD text cannot be represented:") && warning.contains(error)), "{warnings:?}");
+            assert_legacy_error_model(&file, &doc, layer_name);
+        }
+    } else {
+        assert_legacy_error_model(&photocraft_io::document_to_psd(&doc), &doc, layer_name);
+    }
+    assert_eq!(doc, original, "a legacy conversion must not mutate its input document");
+}
+
+#[test]
+fn legacy_export_with_allocator_error_drops_stale_global_text() {
+    assert_legacy_error(true, true);
+}
+
+#[test]
+fn legacy_export_direct_allocator_error_drops_stale_global_text() {
+    assert_legacy_error(true, false);
+}
+
+#[test]
+fn legacy_export_with_builder_error_drops_stale_global_text() {
+    assert_legacy_error(false, true);
+}
+
+#[test]
+fn legacy_export_direct_builder_error_drops_stale_global_text() {
+    assert_legacy_error(false, false);
+}
+
+#[test]
+fn legacy_export_success_and_no_live_type_preserve_global_text_and_opaque_bytes() {
+    let (mut doc, previous) = native_fixture();
+    // A document with no live type can still archive native global objects. No failed
+    // regeneration exists in that case, so the error-path fix must not discard them.
+    for no_live_type in [false, true] {
+        if no_live_type {
+            doc.layers.clear();
+        }
+        let original = doc.clone();
+        let mut files = vec![photocraft_io::document_to_psd(&doc)];
+        for force_psb in [false, true] {
+            let (file, warnings) = photocraft_io::document_to_psd_with(&doc, &photocraft_io::PsdExportOptions { force_psb, ..Default::default() });
+            assert!(!warnings.iter().any(|warning| warning.contains("PSD text cannot be represented:")), "{warnings:?}");
+            files.push(file);
+        }
+        for file in files {
+            assert_eq!(txt2(&file), previous, "a successful or unnecessary regeneration must preserve native global text bytes");
+            assert_eq!(file.global_blocks.iter().find(|block| &block.key == b"zZzz").unwrap().data, [11, 13, 17, 19]);
+        }
+        assert_eq!(doc, original, "successful legacy conversions must not mutate their input");
+    }
+}
+
 fn assert_slot_boundary_roundtrip(free_slot: usize) {
     let slot_count = photocraft_text::psd::MAX_TEXT_INDEX as usize + 1;
     let doc = slot_boundary_document(slot_count, &[free_slot]);
